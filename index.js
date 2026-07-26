@@ -27,6 +27,7 @@ try {
 }
 
 for (const entry of tokens) {
+  if (entry.voteAt === undefined || entry.voteAt === null) continue; // immediate-run token, no times to validate
   const times = Array.isArray(entry.voteAt) ? entry.voteAt : [entry.voteAt];
   for (const t of times) {
     if (!/^\d{1,2}:\d{2}$/.test(t)) {
@@ -71,6 +72,29 @@ function formatMs(ms) {
 
 function nowISO() { return new Date().toISOString(); }
 
+const TURNSTILE_RETRY_MS = 10 * 60 * 1000; // retry Turnstile-blocked bots after 10 min
+const TURNSTILE_MAX_RETRIES = 3; // give up after this many retries until the next scheduled slot
+
+async function retryTurnstileBots(token, botIdsToRetry, attempt = 1) {
+  const short = token.slice(0, 5) + "...";
+  console.log(`[${nowISO()}] [scheduler] Token ${short} retrying ${botIdsToRetry.length} Turnstile-blocked bot(s), attempt ${attempt}`);
+  const results = await voteAllBotsForToken(token, botIdsToRetry);
+
+  const stillBlocked = botIdsToRetry.filter(id => results[id] === "turnstile");
+  if (stillBlocked.length === 0) {
+    console.log(`[${nowISO()}] [scheduler] Token ${short} all retried bots resolved`);
+    return;
+  }
+  if (attempt >= TURNSTILE_MAX_RETRIES) {
+    console.log(`[${nowISO()}] [scheduler] Token ${short} giving up on ${stillBlocked.length} bot(s) after ${attempt} retries — will try again at next scheduled slot`);
+    return;
+  }
+
+  console.log(`[${nowISO()}] [scheduler] Token ${short} ${stillBlocked.length} bot(s) still Turnstile-blocked, retrying again in ${formatMs(TURNSTILE_RETRY_MS)}`);
+  await new Promise(r => setTimeout(r, TURNSTILE_RETRY_MS));
+  await retryTurnstileBots(token, stillBlocked, attempt + 1);
+}
+
 async function scheduleSlot(token, h, m, label) {
   const short = token.slice(0, 5) + "...";
   while (true) {
@@ -78,13 +102,47 @@ async function scheduleSlot(token, h, m, label) {
     console.log(`[${nowISO()}] [scheduler] Token ${short} slot ${label} (${timezone}) fires in ${formatMs(wait)}`);
     await new Promise(r => setTimeout(r, wait));
     console.log(`[${nowISO()}] [scheduler] Token ${short} slot ${label} firing now`);
-    await voteAllBotsForToken(token, botIds);
+
+    const results = await voteAllBotsForToken(token, botIds);
+    const turnstileBlocked = botIds.filter(id => results[id] === "turnstile");
+
+    if (turnstileBlocked.length > 0) {
+      console.log(`[${nowISO()}] [scheduler] Token ${short} ${turnstileBlocked.length} bot(s) blocked by Turnstile, will retry in ${formatMs(TURNSTILE_RETRY_MS)}`);
+      // Fire-and-forget so the main 12h slot loop below isn't held up.
+      retryTurnstileBots(token, turnstileBlocked).catch(err => {
+        console.error(`[${nowISO()}] [scheduler] Token ${short} retry chain crashed: ${err.message}`);
+      });
+    }
+
     await new Promise(r => setTimeout(r, 61000));
+  }
+}
+
+async function runImmediately(token) {
+  const short = token.slice(0, 5) + "...";
+  console.log(`[${nowISO()}] [scheduler] Token ${short} has no voteAt — running immediately`);
+
+  const results = await voteAllBotsForToken(token, botIds);
+  const turnstileBlocked = botIds.filter(id => results[id] === "turnstile");
+
+  if (turnstileBlocked.length > 0) {
+    console.log(`[${nowISO()}] [scheduler] Token ${short} ${turnstileBlocked.length} bot(s) blocked by Turnstile, will retry in ${formatMs(TURNSTILE_RETRY_MS)}`);
+    retryTurnstileBots(token, turnstileBlocked).catch(err => {
+      console.error(`[${nowISO()}] [scheduler] Token ${short} retry chain crashed: ${err.message}`);
+    });
   }
 }
 
 for (const entry of tokens) {
   const { token, voteAt } = entry;
+
+  if (voteAt === undefined || voteAt === null) {
+    runImmediately(token).catch(err => {
+      console.error(`[fatal] immediate run crashed for token ${token.slice(0, 5)}: ${err.message}`);
+    });
+    continue;
+  }
+
   const times = Array.isArray(voteAt) ? voteAt : [voteAt];
   for (const time of times) {
     const [h, m] = time.split(":").map(Number);
