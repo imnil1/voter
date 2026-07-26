@@ -108,10 +108,11 @@ async function doOAuth(page, token, shortT) {
 // "login"   -> neither of the above; assume not authenticated / unknown state
 async function getVotePageState(page) {
   return page.evaluate(() => {
+    const h2s = [...document.querySelectorAll("h2")];
+    const alreadyH2 = h2s.find(h => /already voted/i.test(h.textContent));
+    if (alreadyH2) return "already";
     const btn = document.querySelector("button.button-primary:not([disabled])");
     if (btn && /vote/i.test(btn.textContent)) return "vote";
-    const h2 = document.querySelector("h2");
-    if (h2 && /already voted/i.test(h2.textContent)) return "already";
     return "unknown";
   });
 }
@@ -178,8 +179,8 @@ async function voteForBot(page, token, botId) {
     // verify via DOM state, not hardcoded text — checks the <h2> flips to "already voted"
     const confirmed = await page.waitForFunction(
       () => {
-        const h2 = document.querySelector("h2");
-        return h2 && /already voted/i.test(h2.textContent);
+        const h2s = [...document.querySelectorAll("h2")];
+        return h2s.some(h => /already voted/i.test(h.textContent));
       },
       { timeout: 15000 }
     ).then(() => true).catch(() => false);
@@ -198,8 +199,8 @@ async function voteForBot(page, token, botId) {
         await delay(3000);
         const retryConfirmed = await page.waitForFunction(
           () => {
-            const h2 = document.querySelector("h2");
-            return h2 && /already voted/i.test(h2.textContent);
+            const h2s = [...document.querySelectorAll("h2")];
+            return h2s.some(h => /already voted/i.test(h.textContent));
           },
           { timeout: 15000 }
         ).then(() => true).catch(() => false);
