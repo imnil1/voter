@@ -37,15 +37,6 @@ function clearCookies(token) {
 function nowISO() { return new Date().toISOString(); }
 function log(msg) { console.log(`[${nowISO()}] ${msg}`); }
 
-// Parses "X min" / "X minutes" / "X hours" from top.gg cooldown text, returns ms
-function parseCooldownMs(txt) {
-  const minMatch = txt.match(/(\d+)\s*min/i);
-  const hrMatch  = txt.match(/(\d+)\s*hour/i);
-  if (minMatch) return parseInt(minMatch[1]) * 60 * 1000;
-  if (hrMatch)  return parseInt(hrMatch[1])  * 60 * 60 * 1000;
-  return null;
-}
-
 async function connectBrowser() {
   const wsEndpoint = process.env.BROWSER_WS_URL;
   if (!wsEndpoint) throw new Error("BROWSER_WS_URL is not set");
@@ -111,18 +102,45 @@ async function doOAuth(page, token, shortT) {
   log(`[auth:${shortT}] Authorization successful`);
 }
 
+// DOM-structure-based state check (not text matching) — more robust to copy changes.
+// "vote"    -> a vote button is present and clickable
+// "already" -> the page's <h2> heading indicates a vote was already cast
+// "login"   -> neither of the above; assume not authenticated / unknown state
+async function getVotePageState(page) {
+  return page.evaluate(() => {
+    const btn = document.querySelector("button.button-primary:not([disabled])");
+    if (btn && /vote/i.test(btn.textContent)) return "vote";
+    const h2 = document.querySelector("h2");
+    if (h2 && /already voted/i.test(h2.textContent)) return "already";
+    return "unknown";
+  });
+}
+
+async function getVoteCountdownMs(page) {
+  return page.evaluate(() => {
+    const p = [...document.querySelectorAll("p")]
+      .find(el => /vote again/i.test(el.textContent));
+    const text = p?.textContent || "";
+    const hourMatch = text.match(/(\d+)\s*hour/i);
+    const minMatch  = text.match(/(\d+)\s*min/i);
+    if (hourMatch) return parseInt(hourMatch[1]) * 60 * 60 * 1000;
+    if (minMatch)  return parseInt(minMatch[1])  * 60 * 1000;
+    return null;
+  });
+}
+
 async function waitForVoteStatus(page, timeoutMs) {
   const WAIT_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
   let start = Date.now();
 
   while (true) {
     try {
-      const bodyText = await page.locator("body").innerText();
+      const state = await getVotePageState(page);
 
-      if (bodyText.includes("You can vote now!")) return "vote";
-      if (bodyText.includes("Thanks for voting")) return "already";
-      if (bodyText.includes("You have already voted")) {
-        const cooldownMs = parseCooldownMs(bodyText);
+      if (state === "vote") return "vote";
+
+      if (state === "already") {
+        const cooldownMs = await getVoteCountdownMs(page);
         if (cooldownMs !== null && cooldownMs <= WAIT_THRESHOLD_MS) {
           log(`[vote] Cooldown is ${Math.round(cooldownMs / 60000)} min — waiting it out...`);
           await delay(cooldownMs + 5000);
@@ -152,12 +170,44 @@ async function voteForBot(page, token, botId) {
   log(`[vote:${shortT}] Status for bot ${botId}: ${status}`);
 
   if (status === "vote") {
-    const voteBtn = page.locator("button.button-primary:not([disabled])").first();
+    const voteBtn = page.locator("button.button-primary:not([disabled])", { hasText: "Vote" }).first();
     await voteBtn.waitFor({ state: "visible", timeout: 10000 }).catch(() => {});
     await voteBtn.click();
-    log(`[vote:${shortT}] Vote button clicked for bot ${botId}`);
-    await delay(5000);
-    return true;
+    log(`[vote:${shortT}] Vote button clicked for bot ${botId}, verifying...`);
+
+    // verify via DOM state, not hardcoded text — checks the <h2> flips to "already voted"
+    const confirmed = await page.waitForFunction(
+      () => {
+        const h2 = document.querySelector("h2");
+        return h2 && /already voted/i.test(h2.textContent);
+      },
+      { timeout: 15000 }
+    ).then(() => true).catch(() => false);
+
+    if (confirmed) {
+      log(`[vote:${shortT}] Vote confirmed for bot ${botId}`);
+      return true;
+    } else {
+      log(`[vote:${shortT}] Vote click did not confirm for bot ${botId}, retrying once...`);
+      await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+      await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+      const retryBtn = page.locator("button.button-primary:not([disabled])", { hasText: "Vote" }).first();
+      const retryVisible = await retryBtn.isVisible().catch(() => false);
+      if (retryVisible) {
+        await retryBtn.click();
+        await delay(3000);
+        const retryConfirmed = await page.waitForFunction(
+          () => {
+            const h2 = document.querySelector("h2");
+            return h2 && /already voted/i.test(h2.textContent);
+          },
+          { timeout: 15000 }
+        ).then(() => true).catch(() => false);
+        log(`[vote:${shortT}] Retry ${retryConfirmed ? "confirmed" : "still unconfirmed"} for bot ${botId}`);
+        return retryConfirmed;
+      }
+      return false;
+    }
   } else if (status === "already") {
     log(`[vote:${shortT}] Already voted for bot ${botId}`);
     return false;
