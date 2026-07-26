@@ -104,16 +104,30 @@ async function doOAuth(page, token, shortT) {
 
 // DOM-structure-based state check (not text matching) — more robust to copy changes.
 // "vote"    -> a vote button is present and clickable
-// "already" -> the page's <h2> heading indicates a vote was already cast
-// "login"   -> neither of the above; assume not authenticated / unknown state
+// "already" -> the page indicates a vote was already cast (cooldown screen)
+// "ad-wait" -> the fixed ~10s ad countdown before the Vote button appears
+// "unknown" -> none of the above; caller should keep polling or bail
 async function getVotePageState(page) {
   return page.evaluate(() => {
-    const h2s = [...document.querySelectorAll("h2")];
-    const alreadyH2 = h2s.find(h => /already voted/i.test(h.textContent));
-    if (alreadyH2) return "already";
+    const bodyText = document.body.innerText || "";
+
+    if (/you have already voted/i.test(bodyText) || /you can vote again/i.test(bodyText)) {
+      return "already";
+    }
+    if (/you will be able to vote after this ad/i.test(bodyText)) {
+      return "ad-wait";
+    }
     const btn = document.querySelector("button.button-primary:not([disabled])");
-    if (btn && /vote/i.test(btn.textContent)) return "vote";
+    if (btn && /vote/i.test(btn.textContent) && !/already/i.test(bodyText)) return "vote";
     return "unknown";
+  });
+}
+
+// Detects the post-vote success screen ("Thanks for voting!"), which is the
+// actual confirmation text top.gg shows now — not "already voted".
+async function isVoteConfirmed(page) {
+  return page.evaluate(() => {
+    return [...document.querySelectorAll("h2")].some(h => /thanks for voting/i.test(h.textContent));
   });
 }
 
@@ -262,13 +276,22 @@ async function trySolveTurnstileOnPage(page, shortT) {
 
 async function waitForVoteStatus(page, timeoutMs) {
   const WAIT_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
+  const AD_WAIT_MS = 11 * 1000; // fixed ~10s ad countdown before Vote button appears, +1s buffer
   let start = Date.now();
+  let adWaited = false;
 
   while (true) {
     try {
       const state = await getVotePageState(page);
 
       if (state === "vote") return "vote";
+
+      if (state === "ad-wait" && !adWaited) {
+        log(`[vote] Ad countdown in progress — waiting ${AD_WAIT_MS / 1000}s...`);
+        await delay(AD_WAIT_MS);
+        adWaited = true; // only wait out the ad once per page load
+        continue;
+      }
 
       if (state === "already") {
         const cooldownMs = await getVoteCountdownMs(page);
@@ -278,6 +301,7 @@ async function waitForVoteStatus(page, timeoutMs) {
           await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
           await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
           start = Date.now(); // reset timer after cooldown wait
+          adWaited = false; // fresh page load may show the ad countdown again
           continue;
         }
         return "already";
@@ -326,12 +350,10 @@ async function voteForBot(page, token, botId) {
 
     log(`[vote:${shortT}] No Turnstile detected, verifying vote...`);
 
-    // verify via DOM state, not hardcoded text — checks the <h2> flips to "already voted"
+    // verify via the real success screen text ("Thanks for voting!"), not the
+    // stale "already voted" heading top.gg no longer uses for this state.
     const confirmed = await page.waitForFunction(
-      () => {
-        const h2s = [...document.querySelectorAll("h2")];
-        return h2s.some(h => /already voted/i.test(h.textContent));
-      },
+      () => [...document.querySelectorAll("h2")].some(h => /thanks for voting/i.test(h.textContent)),
       { timeout: 15000 }
     ).then(() => true).catch(() => false);
 
@@ -356,10 +378,7 @@ async function voteForBot(page, token, botId) {
         await delay(1500);
       }
       const lateConfirmed = await page.waitForFunction(
-        () => {
-          const h2s = [...document.querySelectorAll("h2")];
-          return h2s.some(h => /already voted/i.test(h.textContent));
-        },
+        () => [...document.querySelectorAll("h2")].some(h => /thanks for voting/i.test(h.textContent)),
         { timeout: 15000 }
       ).then(() => true).catch(() => false);
       if (lateConfirmed) {
@@ -392,10 +411,7 @@ async function voteForBot(page, token, botId) {
       }
       await delay(1500);
       const retryConfirmed = await page.waitForFunction(
-        () => {
-          const h2s = [...document.querySelectorAll("h2")];
-          return h2s.some(h => /already voted/i.test(h.textContent));
-        },
+        () => [...document.querySelectorAll("h2")].some(h => /thanks for voting/i.test(h.textContent)),
         { timeout: 15000 }
       ).then(() => true).catch(() => false);
       log(`[vote:${shortT}] Retry ${retryConfirmed ? "confirmed" : "still unconfirmed"} for bot ${botId}`);
