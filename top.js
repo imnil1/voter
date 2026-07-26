@@ -5,6 +5,7 @@ const path = require("path");
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const COOKIE_DIR = process.env.COOKIE_DIR || "./cookies";
+const SCREENSHOT_DIR = process.env.SCREENSHOT_DIR || "./screenshots";
 
 function cookiePath(token) {
   return path.join(COOKIE_DIR, `${token.slice(0, 16).replace(/[^a-zA-Z0-9]/g, "_")}.json`);
@@ -37,6 +38,24 @@ function clearCookies(token) {
 function nowISO() { return new Date().toISOString(); }
 function log(msg) { console.log(`[${nowISO()}] ${msg}`); }
 
+// Saves a full-page screenshot for debugging unconfirmed/failed votes.
+// Filename includes label, botId, and a timestamp so repeated failures
+// don't overwrite each other. Never throws — a screenshot failure should
+// never crash the vote flow itself.
+async function saveDebugScreenshot(page, label, botId, reason) {
+  try {
+    if (!fs.existsSync(SCREENSHOT_DIR)) fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
+    const safeLabel = String(label).replace(/[^a-zA-Z0-9_-]/g, "_");
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const filename = `${safeLabel}_${botId}_${reason}_${timestamp}.png`;
+    const filepath = path.join(SCREENSHOT_DIR, filename);
+    await page.screenshot({ path: filepath, fullPage: true });
+    log(`[screenshot:${label}] Saved debug screenshot for bot ${botId}: ${filename}`);
+  } catch (err) {
+    log(`[screenshot:${label}] Failed to save screenshot: ${err.message}`);
+  }
+}
+
 async function connectBrowser() {
   const wsEndpoint = process.env.BROWSER_WS_URL;
   if (!wsEndpoint) throw new Error("BROWSER_WS_URL is not set");
@@ -62,8 +81,8 @@ async function isLoggedInToTopgg(page) {
   }
 }
 
-async function doOAuth(page, token, shortT) {
-  log(`[auth:${shortT}] Setting Discord token in localStorage...`);
+async function doOAuth(page, token, label) {
+  log(`[auth:${label}] Setting Discord token in localStorage...`);
   await page.addInitScript((t) => {
     window.localStorage.setItem("token", `"${t}"`);
   }, token);
@@ -71,14 +90,14 @@ async function doOAuth(page, token, shortT) {
   await page.goto("https://top.gg", { waitUntil: "domcontentloaded", timeout: 30000 });
   await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
 
-  log(`[auth:${shortT}] Clicking login button...`);
+  log(`[auth:${label}] Clicking login button...`);
   const loginBtn = page.locator("button", { hasText: "Login" }).first();
   const loginVisible = await loginBtn.isVisible().catch(() => false);
 
   if (!loginVisible) {
     const bodyText = await page.locator("body").innerText();
     if (!bodyText.includes("Login")) {
-      log(`[auth:${shortT}] Already logged in`);
+      log(`[auth:${label}] Already logged in`);
       return;
     }
     throw new Error("Login button not found and not logged in");
@@ -87,11 +106,11 @@ async function doOAuth(page, token, shortT) {
   await loginBtn.click();
   await page.waitForLoadState("domcontentloaded", { timeout: 15000 });
 
-  log(`[auth:${shortT}] Waiting for Discord authorize button...`);
+  log(`[auth:${label}] Waiting for Discord authorize button...`);
   const authorizeBtn = page.locator("button", { hasText: /authoriz|allow|yes/i }).first();
   await authorizeBtn.waitFor({ state: "visible", timeout: 15000 });
 
-  log(`[auth:${shortT}] Clicking authorize...`);
+  log(`[auth:${label}] Clicking authorize...`);
   await authorizeBtn.click();
 
   await page.waitForLoadState("domcontentloaded", { timeout: 15000 });
@@ -99,7 +118,7 @@ async function doOAuth(page, token, shortT) {
 
   const bodyText = await page.locator("body").innerText();
   if (bodyText.includes("Login")) throw new Error("Authorization failed - Discord OAuth did not complete");
-  log(`[auth:${shortT}] Authorization successful`);
+  log(`[auth:${label}] Authorization successful`);
 }
 
 // DOM-structure-based state check (not text matching) — more robust to copy changes.
@@ -313,8 +332,8 @@ async function waitForVoteStatus(page, timeoutMs) {
   }
 }
 
-async function voteForBot(page, token, botId) {
-  const shortT = token.slice(0, 5) + "...";
+async function voteForBot(page, label, botId) {
+  const shortT = label;
   const timeoutMs = 60_000;
 
   log(`[vote:${shortT}] Navigating to vote page for bot ${botId}...`);
@@ -337,6 +356,7 @@ async function voteForBot(page, token, botId) {
       const solved = await trySolveTurnstileOnPage(page, shortT);
       if (!solved) {
         log(`[vote:${shortT}] Could not solve Turnstile for bot ${botId} — skipping, will retry later`);
+        await saveDebugScreenshot(page, shortT, botId, "turnstile-unsolved");
         return "turnstile";
       }
       log(`[vote:${shortT}] Turnstile solved for bot ${botId}, re-checking vote button...`);
@@ -368,6 +388,7 @@ async function voteForBot(page, token, botId) {
       const solvedLate = await trySolveTurnstileOnPage(page, shortT);
       if (!solvedLate) {
         log(`[vote:${shortT}] Could not solve late Turnstile for bot ${botId} — skipping, will retry later`);
+        await saveDebugScreenshot(page, shortT, botId, "turnstile-unsolved-late");
         return "turnstile";
       }
       log(`[vote:${shortT}] Late Turnstile solved for bot ${botId}, re-checking vote button...`);
@@ -400,6 +421,7 @@ async function voteForBot(page, token, botId) {
         const solvedRetry = await trySolveTurnstileOnPage(page, shortT);
         if (!solvedRetry) {
           log(`[vote:${shortT}] Could not solve Turnstile on retry for bot ${botId} — skipping, will retry later`);
+          await saveDebugScreenshot(page, shortT, botId, "turnstile-unsolved-retry");
           return "turnstile";
         }
         const revoteBtn3 = page.locator("button.button-primary:not([disabled])", { hasText: "Vote" }).first();
@@ -415,21 +437,28 @@ async function voteForBot(page, token, botId) {
         { timeout: 15000 }
       ).then(() => true).catch(() => false);
       log(`[vote:${shortT}] Retry ${retryConfirmed ? "confirmed" : "still unconfirmed"} for bot ${botId}`);
+      if (!retryConfirmed) {
+        await saveDebugScreenshot(page, shortT, botId, "unconfirmed");
+      }
       return retryConfirmed ? "confirmed" : "failed";
     }
+    await saveDebugScreenshot(page, shortT, botId, "no-retry-button");
     return "failed";
   } else if (status === "already") {
     log(`[vote:${shortT}] Already voted for bot ${botId}`);
     return "already";
   } else {
     log(`[vote:${shortT}] Vote timed out for bot ${botId}`);
+    await saveDebugScreenshot(page, shortT, botId, "timeout");
     return "failed";
   }
 }
 
-// Main entry point: one session per token, votes all bots in that session
-async function voteAllBotsForToken(token, botIds) {
-  const shortT = token.slice(0, 5) + "...";
+// Main entry point: one session per token, votes all bots in that session.
+// `label` is an optional human-readable name for logging (falls back to a
+// truncated token prefix if not provided).
+async function voteAllBotsForToken(token, botIds, label) {
+  const shortT = label || (token.slice(0, 5) + "...");
 
   log(`[token:${shortT}] Validating...`);
   try {
@@ -478,7 +507,7 @@ async function voteAllBotsForToken(token, botIds) {
 
     for (const botId of botIds) {
       try {
-        results[botId] = await voteForBot(page, token, botId);
+        results[botId] = await voteForBot(page, shortT, botId);
       } catch (err) {
         log(`[token:${shortT}] Error voting for bot ${botId}: ${err.message}`);
         results[botId] = "failed";
