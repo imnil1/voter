@@ -7,8 +7,14 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const COOKIE_DIR = process.env.COOKIE_DIR || "./cookies";
 const SCREENSHOT_DIR = process.env.SCREENSHOT_DIR || "./screenshots";
 
+const crypto = require("crypto");
+
 function cookiePath(token) {
-  return path.join(COOKIE_DIR, `${token.slice(0, 16).replace(/[^a-zA-Z0-9]/g, "_")}.json`);
+  // Hash rather than slice the raw token — two tokens sharing the same
+  // first N characters (plausible given common token-format prefixes)
+  // would otherwise silently overwrite each other's saved cookies.
+  const hash = crypto.createHash("sha256").update(token).digest("hex").slice(0, 16);
+  return path.join(COOKIE_DIR, `${hash}.json`);
 }
 
 function loadCookies(token) {
@@ -56,27 +62,106 @@ function log(msg) { console.log(`[${nowFormatted()}] ${msg}`); }
 // Filename includes label, botId, and a timestamp so repeated failures
 // don't overwrite each other. Never throws — a screenshot failure should
 // never crash the vote flow itself.
+//
+// Known Playwright/Chromium quirks this specifically works around:
+//  - `networkidle` is documented as unreliable on pages with polling,
+//    analytics, or third-party iframes (Discord/top.gg/Turnstile all
+//    qualify) — it can time out every single time instead of settling,
+//    silently wasting the full timeout for nothing. `load` is used instead,
+//    since DOMContentLoaded + resource load is a deterministic event that
+//    will always fire, unlike networkidle's "no network activity" window.
+//  - Full-page screenshots duplicate or distort `position: fixed`/`sticky`
+//    elements (nav bars, cookie banners, Turnstile overlays) because
+//    Chromium expands the capture surface but fixed elements re-pin
+//    themselves at every scroll position during the stitch. Converting
+//    them to `absolute` just before capture (and only in memory, on a
+//    throwaway debug page — never on the live interaction page) avoids this.
+//  - If the page/context/browser already closed (e.g. mid-crash, which is
+//    exactly when this function tends to get called), every call below can
+//    throw "Target page, context or browser has been closed". This is
+//    expected in that case and is now logged distinctly from a genuine
+//    screenshot bug, so the two aren't indistinguishable in the logs.
 async function saveDebugScreenshot(page, label, botId, reason, fullPage = false) {
   try {
+    if (page.isClosed()) {
+      log(`[screenshot:${label}] Skipped for bot ${botId} (${reason}) — page already closed`);
+      return;
+    }
+
     if (!fs.existsSync(SCREENSHOT_DIR)) fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
-    // Give any in-flight rendering (images, lazy content) a moment to settle
-    // before capturing — otherwise fullPage screenshots can come out
-    // truncated if taken the instant a text condition becomes true.
-    await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
+
+    // "load" instead of "networkidle" — deterministic, won't burn the full
+    // timeout on pages with continuous background network activity.
+    await page.waitForLoadState("load", { timeout: 5000 }).catch(() => {});
+    // Small settle delay for any last lazy-rendered content/images.
     await delay(500);
+
     // Re-assert viewport in case a navigation/redirect reset it — CDP-connected
     // sessions can be less reliable about retaining viewport size than a
     // locally-launched browser.
     await page.setViewportSize({ width: 1920, height: 1080 }).catch(() => {});
+
+    if (fullPage) {
+      // Neutralize fixed/sticky elements only for the duration of this
+      // capture so full-page screenshots don't show duplicated/smeared
+      // headers or overlays. Restored immediately after regardless of
+      // whether the screenshot itself succeeds.
+      await page.evaluate(() => {
+        const fixedEls = [];
+        for (const el of document.querySelectorAll("*")) {
+          const pos = window.getComputedStyle(el).position;
+          if (pos === "fixed" || pos === "sticky") {
+            fixedEls.push([el, el.style.position]);
+            el.style.position = "absolute";
+          }
+        }
+        window.__debugScreenshotRestoreFixed = () => {
+          for (const [el, original] of fixedEls) el.style.position = original;
+        };
+      }).catch(() => {});
+    }
+
     const safeLabel = String(label).replace(/[^a-zA-Z0-9_-]/g, "_");
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const filename = `${safeLabel}_${botId}_${reason}_${timestamp}.png`;
     const filepath = path.join(SCREENSHOT_DIR, filename);
-    await page.screenshot({ path: filepath, fullPage });
-    log(`[screenshot:${label}] Saved debug screenshot for bot ${botId}: ${filename}`);
+
+    try {
+      await page.screenshot({ path: filepath, fullPage, timeout: 15000 });
+      log(`[screenshot:${label}] Saved debug screenshot for bot ${botId}: ${filename}`);
+    } finally {
+      if (fullPage) {
+        await page.evaluate(() => {
+          if (window.__debugScreenshotRestoreFixed) {
+            window.__debugScreenshotRestoreFixed();
+            delete window.__debugScreenshotRestoreFixed;
+          }
+        }).catch(() => {});
+      }
+    }
   } catch (err) {
-    log(`[screenshot:${label}] Failed to save screenshot: ${err.message}`);
+    if (/closed/i.test(err.message)) {
+      log(`[screenshot:${label}] Could not capture for bot ${botId} (${reason}) — page/context/browser closed before or during capture`);
+    } else {
+      log(`[screenshot:${label}] Failed to save screenshot: ${err.message}`);
+    }
   }
+}
+
+// Overridable via env var so keeping the UA's claimed Chrome version in
+// sync with browserless-v2's actual Chromium build doesn't require a code
+// change/redeploy — just a Railway env var update.
+const SPOOFED_USER_AGENT = process.env.SPOOFED_USER_AGENT ||
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+// Applies the same viewport + UA setup to any page — used for both the
+// initial auth page and every pre-opened bot tab, so every tab gets
+// identical, correctly-sized rendering and consistent fingerprinting
+// instead of only the first page getting it.
+async function preparePage(page) {
+  await page.setViewportSize({ width: 1920, height: 1080 });
+  await page.setExtraHTTPHeaders({ "User-Agent": SPOOFED_USER_AGENT });
+  return page;
 }
 
 async function connectBrowser() {
@@ -99,12 +184,9 @@ async function connectBrowser() {
   const browser = await chromium.connectOverCDP(wsEndpoint, { timeout: 30000 });
   const context = browser.contexts()[0] || (await browser.newContext());
   const page = await context.newPage();
-  await page.setViewportSize({ width: 1920, height: 1080 });
+  await preparePage(page);
   const actualViewport = page.viewportSize();
   log(`[browser] Viewport set to ${actualViewport?.width}x${actualViewport?.height}`);
-  await page.setExtraHTTPHeaders({
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-  });
   return { browser, context, page };
 }
 
@@ -242,11 +324,14 @@ async function getVotePageState(page) {
 }
 
 // Detects the post-vote success screen ("Thanks for voting!"), which is the
-// actual confirmation text top.gg shows now — not "already voted".
-async function isVoteConfirmed(page) {
-  return page.evaluate(() => {
-    return [...document.querySelectorAll("h2")].some(h => /thanks for voting/i.test(h.textContent));
-  });
+// actual confirmation text top.gg shows now — not "already voted". Used by
+// every confirmation check in voteForBot (initial, after late Turnstile,
+// and after retry) so there's a single source of truth for this check.
+async function isVoteConfirmed(page, timeoutMs = 15000) {
+  return page.waitForFunction(
+    () => [...document.querySelectorAll("h2")].some(h => /thanks for voting/i.test(h.textContent)),
+    { timeout: timeoutMs }
+  ).then(() => true).catch(() => false);
 }
 
 // Detects a Cloudflare Turnstile challenge iframe on the page.
@@ -320,13 +405,15 @@ async function injectTurnstileToken(page, tokenValue) {
   }, tokenValue);
 }
 
-const SOLVER_URL = (process.env.TURNSTILE_SOLVER_URL || "").replace(/\/$/, "");
-const SOLVER_KEY = process.env.TURNSTILE_SOLVER_KEY || "";
-
 // Submits a Turnstile solve task to the self-hosted icemellow-me solver
 // (2captcha-compatible API) and polls until solved, failed, or timed out.
 // Returns the token string, or null if solving failed/unavailable.
+// Reads env vars fresh on each call (rather than once at module load) so
+// credentials can be rotated via Railway without requiring a redeploy.
 async function solveTurnstile(sitekey, pageUrl, shortT) {
+  const SOLVER_URL = (process.env.TURNSTILE_SOLVER_URL || "").replace(/\/$/, "");
+  const SOLVER_KEY = process.env.TURNSTILE_SOLVER_KEY || "";
+
   if (!SOLVER_URL || !SOLVER_KEY) {
     log(`[turnstile-solver:${shortT}] TURNSTILE_SOLVER_URL/KEY not configured, skipping solve attempt`);
     return null;
@@ -405,6 +492,12 @@ async function trySolveTurnstileOnPage(page, shortT) {
 }
 
 async function waitForVoteStatus(page, timeoutMs) {
+  // Note: `timeoutMs` bounds each individual polling phase, not the overall
+  // call. A cooldown wait resets `start` afterward (see below) so a bot
+  // that cycles through several short cooldowns in a row can legitimately
+  // run past the nominal `timeoutMs` passed in by the caller — this is
+  // intentional (each cooldown is still capped by WAIT_THRESHOLD_MS below),
+  // not an unbounded loop.
   const WAIT_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
   const AD_WAIT_MS = 11 * 1000; // fixed ~10s ad countdown before Vote button appears, +1s buffer
   let start = Date.now();
@@ -443,13 +536,44 @@ async function waitForVoteStatus(page, timeoutMs) {
   }
 }
 
+// Navigates with a single retry specifically for ERR_ABORTED — a transient
+// Chromium navigation-race error (one goto() interrupted by another
+// in-flight navigation, e.g. top.gg's own client-side redirect right after
+// OAuth completes). Any other error is thrown as-is; only this specific,
+// known-transient case gets retried.
+async function gotoWithRetry(page, url, shortT, botId) {
+  try {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+  } catch (err) {
+    if (/ERR_ABORTED/i.test(err.message)) {
+      log(`[vote:${shortT}] goto() hit ERR_ABORTED for bot ${botId} — likely a navigation race, retrying once after a short delay...`);
+      await delay(1500);
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    } else {
+      throw err;
+    }
+  }
+}
+
 async function voteForBot(page, label, botId) {
   const shortT = label;
   const timeoutMs = 60_000;
 
-  log(`[vote:${shortT}] Navigating to vote page for bot ${botId}...`);
-  await page.goto(`https://top.gg/bot/${botId}/vote`, { waitUntil: "domcontentloaded", timeout: 30000 });
-  await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+  // If this page was already pre-opened and navigated to its vote URL (see
+  // the staggered tab-opening in voteAllBotsForToken), skip re-navigating —
+  // the ad countdown / Turnstile render may already be underway or settled,
+  // and re-doing the goto() here would restart the ad wait for nothing.
+  const votePageUrl = `https://top.gg/bot/${botId}/vote`;
+  const alreadyThere = page.url().startsWith(votePageUrl);
+
+  if (!alreadyThere) {
+    log(`[vote:${shortT}] Navigating to vote page for bot ${botId}...`);
+    await gotoWithRetry(page, votePageUrl, shortT, botId);
+    await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+  } else {
+    log(`[vote:${shortT}] Tab for bot ${botId} was pre-opened — already on vote page, settling...`);
+    await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+  }
 
   const status = await waitForVoteStatus(page, timeoutMs);
   log(`[vote:${shortT}] Status for bot ${botId}: ${status}`);
@@ -483,10 +607,7 @@ async function voteForBot(page, label, botId) {
 
     // verify via the real success screen text ("Thanks for voting!"), not the
     // stale "already voted" heading top.gg no longer uses for this state.
-    const confirmed = await page.waitForFunction(
-      () => [...document.querySelectorAll("h2")].some(h => /thanks for voting/i.test(h.textContent)),
-      { timeout: 15000 }
-    ).then(() => true).catch(() => false);
+    const confirmed = await isVoteConfirmed(page);
 
     if (confirmed) {
       log(`[vote:${shortT}] Vote confirmed for bot ${botId}`);
@@ -509,10 +630,7 @@ async function voteForBot(page, label, botId) {
         await revoteBtn2.click();
         await delay(1500);
       }
-      const lateConfirmed = await page.waitForFunction(
-        () => [...document.querySelectorAll("h2")].some(h => /thanks for voting/i.test(h.textContent)),
-        { timeout: 15000 }
-      ).then(() => true).catch(() => false);
+      const lateConfirmed = await isVoteConfirmed(page);
       if (lateConfirmed) {
         log(`[vote:${shortT}] Vote confirmed for bot ${botId} after solving late Turnstile`);
         return "confirmed";
@@ -561,10 +679,7 @@ async function voteForBot(page, label, botId) {
         await delay(1500);
       }
       await delay(1500);
-      const retryConfirmed = await page.waitForFunction(
-        () => [...document.querySelectorAll("h2")].some(h => /thanks for voting/i.test(h.textContent)),
-        { timeout: 15000 }
-      ).then(() => true).catch(() => false);
+      const retryConfirmed = await isVoteConfirmed(page);
       log(`[vote:${shortT}] Retry ${retryConfirmed ? "confirmed" : "still unconfirmed"} for bot ${botId}`);
       if (!retryConfirmed) {
         await saveDebugScreenshot(page, shortT, botId, "unconfirmed");
@@ -638,9 +753,49 @@ async function voteAllBotsForToken(token, botIds, label) {
       log(`[token:${shortT}] Cookies saved`);
     }
 
-    for (const botId of botIds) {
+    // Pre-open a tab per remaining bot right after auth/cookie-login is
+    // confirmed, and navigate each to its vote page immediately — this lets
+    // the ~10s ad countdown (and any Turnstile render/auto-solve) for bots
+    // #2+ tick down in the background while bot #1 is being processed,
+    // instead of only starting once we get to that bot sequentially.
+    // Tabs share the same authenticated `context`, so no re-auth is needed.
+    // Opened with a 2-3s stagger between each to avoid dogpiling
+    // browserless-v2 with simultaneous navigations (this is also what
+    // caused the ERR_ABORTED seen when a goto() landed too close to
+    // another in-flight navigation). Processing itself stays strictly
+    // one-page-at-a-time below — only the passive waiting is concurrent.
+    //
+    // Each pre-open's navigation (including its own ERR_ABORTED retry) is
+    // fully awaited before moving on to stagger-open the next tab. This
+    // guarantees that by the time the main loop below reaches any given
+    // bot, that bot's pre-open (and any retry within it) has already
+    // finished — so voteForBot() never races a still-in-flight goto() on
+    // the same page.
+    const pages = [page]; // bot #1 reuses the auth page
+    for (let i = 1; i < botIds.length; i++) {
+      const staggerMs = 2000 + Math.floor(Math.random() * 1000); // 2-3s
+      await delay(staggerMs);
+      const botId = botIds[i];
       try {
-        results[botId] = await voteForBot(page, shortT, botId);
+        const p = await context.newPage();
+        await preparePage(p);
+        log(`[token:${shortT}] Pre-opening tab for bot ${botId}...`);
+        await gotoWithRetry(p, `https://top.gg/bot/${botId}/vote`, shortT, botId).catch((err) => {
+          log(`[token:${shortT}] Pre-open navigation failed for bot ${botId}: ${err.message} — will retry inline when processed`);
+        });
+        pages.push(p);
+      } catch (err) {
+        log(`[token:${shortT}] Failed to pre-open tab for bot ${botId}: ${err.message} — will open inline when processed`);
+        pages.push(null);
+      }
+    }
+
+    for (let i = 0; i < botIds.length; i++) {
+      const botId = botIds[i];
+      // Fall back to the shared `page` if pre-opening this tab failed earlier.
+      const botPage = pages[i] || page;
+      try {
+        results[botId] = await voteForBot(botPage, shortT, botId);
       } catch (err) {
         log(`[token:${shortT}] Error voting for bot ${botId}: ${err.message}`);
         results[botId] = "failed";
@@ -654,6 +809,20 @@ async function voteAllBotsForToken(token, botIds, label) {
 
     for (const botId of botIds) {
       if (!(botId in results)) results[botId] = "failed";
+    }
+
+    // Close any extra tabs we opened beyond the original auth page. Errors
+    // here are almost always "already closed" (e.g. browserless killed it
+    // after a crash) and are safe to ignore, but logged at low volume so a
+    // genuine close failure isn't completely invisible.
+    for (let i = 1; i < pages.length; i++) {
+      if (pages[i]) {
+        try {
+          await pages[i].close();
+        } catch (err) {
+          log(`[token:${shortT}] Note: tab close for bot ${botIds[i]} failed (likely already closed): ${err.message}`);
+        }
+      }
     }
 
     const updatedCookies = await context.cookies().catch(() => null);
