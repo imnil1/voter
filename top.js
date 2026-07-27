@@ -56,7 +56,7 @@ function log(msg) { console.log(`[${nowFormatted()}] ${msg}`); }
 // Filename includes label, botId, and a timestamp so repeated failures
 // don't overwrite each other. Never throws — a screenshot failure should
 // never crash the vote flow itself.
-async function saveDebugScreenshot(page, label, botId, reason) {
+async function saveDebugScreenshot(page, label, botId, reason, fullPage = false) {
   try {
     if (!fs.existsSync(SCREENSHOT_DIR)) fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
     // Give any in-flight rendering (images, lazy content) a moment to settle
@@ -68,7 +68,7 @@ async function saveDebugScreenshot(page, label, botId, reason) {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const filename = `${safeLabel}_${botId}_${reason}_${timestamp}.png`;
     const filepath = path.join(SCREENSHOT_DIR, filename);
-    await page.screenshot({ path: filepath, fullPage: false });
+    await page.screenshot({ path: filepath, fullPage });
     log(`[screenshot:${label}] Saved debug screenshot for bot ${botId}: ${filename}`);
   } catch (err) {
     log(`[screenshot:${label}] Failed to save screenshot: ${err.message}`);
@@ -126,16 +126,16 @@ async function doOAuth(page, token, label) {
   try {
     await page.waitForLoadState("domcontentloaded", { timeout: 15000 });
   } catch (err) {
-    await saveDebugScreenshot(page, label, "oauth", "post-login-click-timeout");
+    await saveDebugScreenshot(page, label, "oauth", "post-login-click-timeout", true);
     throw err;
   }
 
   log(`[auth:${label}] Waiting for Discord authorize button...`);
   const authorizeBtn = page.locator("button", { hasText: /authoriz|allow|yes/i }).first();
   try {
-    await authorizeBtn.waitFor({ state: "visible", timeout: 15000 });
+    await authorizeBtn.waitFor({ state: "visible", timeout: 30000 });
   } catch (err) {
-    await saveDebugScreenshot(page, label, "oauth", "authorize-button-missing");
+    await saveDebugScreenshot(page, label, "oauth", "authorize-button-missing", true);
     throw err;
   }
 
