@@ -149,17 +149,68 @@ async function doOAuth(page, token, label) {
     throw err;
   }
 
-  log(`[auth:${label}] Waiting for Discord authorize button...`);
-  const authorizeBtn = page.locator("button", { hasText: /authoriz|allow|yes/i }).first();
+  log(`[auth:${label}] Waiting for Discord consent page to render...`);
+  // Discord's consent screen requires scrolling its permissions-list
+  // container to the end before "Authorize" replaces a "Keep Scrolling..."
+  // button. The container has CSS-module classes with a hash suffix that
+  // can change between Discord deploys (confirmed as of writing:
+  // "body__8a031 auto_d125d2 scrollerBase_d125d2") — matching on the
+  // stable "scrollerBase" substring instead of the exact hashed name.
+  const scrollableBtn = page.locator("button", { hasText: /authoriz|allow|yes|keep scrolling/i }).first();
   try {
-    await authorizeBtn.waitFor({ state: "visible", timeout: 30000 });
+    await scrollableBtn.waitFor({ state: "visible", timeout: 30000 });
   } catch (err) {
     await saveDebugScreenshot(page, label, "oauth", "authorize-button-missing", true);
     throw err;
   }
 
+  const scrolled = await page.evaluate(() => {
+    const el = [...document.querySelectorAll("div[class*='scrollerBase']")][0];
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+      return true;
+    }
+    return false;
+  }).catch(() => false);
+  log(`[auth:${label}] Scrolled consent list to bottom: ${scrolled}`);
+  await delay(500);
+
+  let authorizeBtn = page.locator("button", { hasText: /authoriz|allow|yes/i }).first();
+  let authorizeVisible = await authorizeBtn.waitFor({ state: "visible", timeout: 15000 })
+    .then(() => true).catch(() => false);
+
+  if (!authorizeVisible) {
+    // Scroll alone didn't reveal it — fall back to zooming out (shrinks the
+    // whole page so the list fits without scrolling) combined with a
+    // broader scroller-container match, matching the approach in the
+    // reference implementation (captcha_helper.py).
+    log(`[auth:${label}] Authorize still hidden after scroll — trying zoom-out fallback...`);
+    await page.evaluate(() => { document.body.style.zoom = "0.5"; }).catch(() => {});
+    await delay(1000);
+    await page.evaluate(() => { window.scrollTo(0, document.body.scrollHeight); }).catch(() => {});
+    await delay(1000);
+    await page.evaluate(() => {
+      const el = [...document.querySelectorAll("[class*='scroller']")][0];
+      if (el) el.scrollTop = el.scrollHeight;
+    }).catch(() => {});
+    await delay(1000);
+
+    authorizeBtn = page.locator("button", { hasText: /authoriz|allow|yes/i }).first();
+    authorizeVisible = await authorizeBtn.waitFor({ state: "visible", timeout: 15000 })
+      .then(() => true).catch(() => false);
+  }
+
+  if (!authorizeVisible) {
+    await saveDebugScreenshot(page, label, "oauth", "authorize-still-scrolling", true);
+    throw new Error("Authorize button never became visible after scroll and zoom-out attempts");
+  }
+
   log(`[auth:${label}] Clicking authorize...`);
   await authorizeBtn.click();
+
+  // Restore normal zoom in case the fallback path changed it, so later
+  // screenshots and interactions on top.gg aren't affected.
+  await page.evaluate(() => { document.body.style.zoom = "1"; }).catch(() => {});
 
   await page.waitForLoadState("domcontentloaded", { timeout: 15000 });
   await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
