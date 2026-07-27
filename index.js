@@ -42,7 +42,7 @@ function getTimezoneOffsetMs(tz, date) {
   return new Date(tzStr) - new Date(utcStr);
 }
 
-function msUntilNext(h, m, tz) {
+function nextFireDate(h, m, tz) {
   const now = new Date();
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: tz,
@@ -58,9 +58,20 @@ function msUntilNext(h, m, tz) {
   );
   if (candidate <= now) {
     const tomorrow = new Date(Date.UTC(year, month, day + 1, h, m, 0));
-    return tomorrow - getTimezoneOffsetMs(tz, tomorrow) - now;
+    return new Date(tomorrow - getTimezoneOffsetMs(tz, tomorrow));
   }
-  return candidate - now;
+  return candidate;
+}
+
+function msUntilNext(h, m, tz) {
+  return nextFireDate(h, m, tz) - new Date();
+}
+
+function formatFireTime(date, tz) {
+  return date.toLocaleString("en-US", {
+    timeZone: tz,
+    hour: "numeric", minute: "2-digit", hour12: true,
+  });
 }
 
 function formatMs(ms) {
@@ -107,8 +118,9 @@ async function retryTurnstileBots(token, tokenLabel, botIdsToRetry, attempt = 1)
 
 async function scheduleSlot(token, tokenLabel, h, m, slotLabel) {
   while (true) {
-    const wait = msUntilNext(h, m, timezone);
-    console.log(`[${nowISO()}] [scheduler] Token ${tokenLabel} slot ${slotLabel} (${timezone}) fires in ${formatMs(wait)}`);
+    const fireDate = nextFireDate(h, m, timezone);
+    const wait = fireDate - new Date();
+    console.log(`[${nowISO()}] [scheduler] Token ${tokenLabel} slot ${slotLabel} (${timezone}) fires at ${formatFireTime(fireDate, timezone)}`);
     await new Promise(r => setTimeout(r, wait));
     console.log(`[${nowISO()}] [scheduler] Token ${tokenLabel} slot ${slotLabel} firing now`);
 

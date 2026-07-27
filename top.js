@@ -123,11 +123,21 @@ async function doOAuth(page, token, label) {
   }
 
   await loginBtn.click();
-  await page.waitForLoadState("domcontentloaded", { timeout: 15000 });
+  try {
+    await page.waitForLoadState("domcontentloaded", { timeout: 15000 });
+  } catch (err) {
+    await saveDebugScreenshot(page, label, "oauth", "post-login-click-timeout");
+    throw err;
+  }
 
   log(`[auth:${label}] Waiting for Discord authorize button...`);
   const authorizeBtn = page.locator("button", { hasText: /authoriz|allow|yes/i }).first();
-  await authorizeBtn.waitFor({ state: "visible", timeout: 15000 });
+  try {
+    await authorizeBtn.waitFor({ state: "visible", timeout: 15000 });
+  } catch (err) {
+    await saveDebugScreenshot(page, label, "oauth", "authorize-button-missing");
+    throw err;
+  }
 
   log(`[auth:${label}] Clicking authorize...`);
   await authorizeBtn.click();
@@ -552,12 +562,20 @@ async function voteAllBotsForToken(token, botIds, label) {
       } catch (err) {
         log(`[token:${shortT}] Error voting for bot ${botId}: ${err.message}`);
         results[botId] = "failed";
+        if (/page crashed/i.test(err.message) || /target crashed/i.test(err.message)) {
+          log(`[token:${shortT}] Browser/page crashed — aborting remaining bots for this session`);
+          break;
+        }
       }
       await delay(2000);
     }
 
-    const updatedCookies = await context.cookies();
-    saveCookies(token, updatedCookies);
+    for (const botId of botIds) {
+      if (!(botId in results)) results[botId] = "failed";
+    }
+
+    const updatedCookies = await context.cookies().catch(() => null);
+    if (updatedCookies) saveCookies(token, updatedCookies);
 
   } catch (err) {
     log(`[token:${shortT}] Fatal error: ${err.message}`);
