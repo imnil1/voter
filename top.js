@@ -536,17 +536,26 @@ async function waitForVoteStatus(page, timeoutMs) {
   }
 }
 
-// Navigates with a single retry specifically for ERR_ABORTED — a transient
-// Chromium navigation-race error (one goto() interrupted by another
-// in-flight navigation, e.g. top.gg's own client-side redirect right after
-// OAuth completes). Any other error is thrown as-is; only this specific,
-// known-transient case gets retried.
+// Navigates with a single retry for two known-transient failure modes:
+//  - ERR_ABORTED: a Chromium navigation race (one goto() interrupted by
+//    another in-flight navigation, e.g. top.gg's own client-side redirect
+//    right after OAuth completes).
+//  - a flat navigation timeout ("Timeout 30000ms exceeded"): seen in
+//    practice under browserless-v2 resource pressure, but also plausible
+//    from an ordinary slow/transient page load even without contention —
+//    cheap to retry once either way.
+// Any other error is thrown as-is; only these two specific, known-transient
+// cases get retried.
 async function gotoWithRetry(page, url, shortT, botId) {
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
   } catch (err) {
     if (/ERR_ABORTED/i.test(err.message)) {
       log(`[vote:${shortT}] goto() hit ERR_ABORTED for bot ${botId} — likely a navigation race, retrying once after a short delay...`);
+      await delay(1500);
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    } else if (/timeout/i.test(err.message)) {
+      log(`[vote:${shortT}] goto() timed out for bot ${botId} — retrying once after a short delay...`);
       await delay(1500);
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
     } else {
@@ -559,21 +568,10 @@ async function voteForBot(page, label, botId) {
   const shortT = label;
   const timeoutMs = 60_000;
 
-  // If this page was already pre-opened and navigated to its vote URL (see
-  // the staggered tab-opening in voteAllBotsForToken), skip re-navigating —
-  // the ad countdown / Turnstile render may already be underway or settled,
-  // and re-doing the goto() here would restart the ad wait for nothing.
   const votePageUrl = `https://top.gg/bot/${botId}/vote`;
-  const alreadyThere = page.url().startsWith(votePageUrl);
-
-  if (!alreadyThere) {
-    log(`[vote:${shortT}] Navigating to vote page for bot ${botId}...`);
-    await gotoWithRetry(page, votePageUrl, shortT, botId);
-    await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
-  } else {
-    log(`[vote:${shortT}] Tab for bot ${botId} was pre-opened — already on vote page, settling...`);
-    await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
-  }
+  log(`[vote:${shortT}] Navigating to vote page for bot ${botId}...`);
+  await gotoWithRetry(page, votePageUrl, shortT, botId);
+  await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
 
   const status = await waitForVoteStatus(page, timeoutMs);
   log(`[vote:${shortT}] Status for bot ${botId}: ${status}`);
@@ -753,49 +751,22 @@ async function voteAllBotsForToken(token, botIds, label) {
       log(`[token:${shortT}] Cookies saved`);
     }
 
-    // Pre-open a tab per remaining bot right after auth/cookie-login is
-    // confirmed, and navigate each to its vote page immediately — this lets
-    // the ~10s ad countdown (and any Turnstile render/auto-solve) for bots
-    // #2+ tick down in the background while bot #1 is being processed,
-    // instead of only starting once we get to that bot sequentially.
-    // Tabs share the same authenticated `context`, so no re-auth is needed.
-    // Opened with a 2-3s stagger between each to avoid dogpiling
-    // browserless-v2 with simultaneous navigations (this is also what
-    // caused the ERR_ABORTED seen when a goto() landed too close to
-    // another in-flight navigation). Processing itself stays strictly
-    // one-page-at-a-time below — only the passive waiting is concurrent.
-    //
-    // Each pre-open's navigation (including its own ERR_ABORTED retry) is
-    // fully awaited before moving on to stagger-open the next tab. This
-    // guarantees that by the time the main loop below reaches any given
-    // bot, that bot's pre-open (and any retry within it) has already
-    // finished — so voteForBot() never races a still-in-flight goto() on
-    // the same page.
-    const pages = [page]; // bot #1 reuses the auth page
-    for (let i = 1; i < botIds.length; i++) {
-      const staggerMs = 2000 + Math.floor(Math.random() * 1000); // 2-3s
-      await delay(staggerMs);
-      const botId = botIds[i];
-      try {
-        const p = await context.newPage();
-        await preparePage(p);
-        log(`[token:${shortT}] Pre-opening tab for bot ${botId}...`);
-        await gotoWithRetry(p, `https://top.gg/bot/${botId}/vote`, shortT, botId).catch((err) => {
-          log(`[token:${shortT}] Pre-open navigation failed for bot ${botId}: ${err.message} — will retry inline when processed`);
-        });
-        pages.push(p);
-      } catch (err) {
-        log(`[token:${shortT}] Failed to pre-open tab for bot ${botId}: ${err.message} — will open inline when processed`);
-        pages.push(null);
-      }
-    }
+    // Sequential processing, one bot/page at a time. Pre-opening tabs for
+    // upcoming bots was tried (to overlap the ~10s ad countdown / Turnstile
+    // render with the current bot's processing) but reverted: browserless-v2
+    // is on a 1GB memory limit, and 3 concurrent tabs (shared page + 2
+    // pre-opened) already pushed it to ~721MB+ in one run — confirmed via
+    // the Railway metrics dashboard, with the memory/CPU spike landing at
+    // the exact timestamp of a bot #1 goto() timeout and a bot #3 3-minute
+    // stall in waitForVoteStatus. That headroom is too thin to risk an OOM
+    // kill for a ~10-20s/bot speedup. Reusing a single `page` keeps peak
+    // memory bounded to one top.gg tab (+ Turnstile iframe) at a time.
+    const pages = [page]; // kept as an array for compatibility with the tab-close loop below
 
     for (let i = 0; i < botIds.length; i++) {
       const botId = botIds[i];
-      // Fall back to the shared `page` if pre-opening this tab failed earlier.
-      const botPage = pages[i] || page;
       try {
-        results[botId] = await voteForBot(botPage, shortT, botId);
+        results[botId] = await voteForBot(page, shortT, botId);
       } catch (err) {
         log(`[token:${shortT}] Error voting for bot ${botId}: ${err.message}`);
         results[botId] = "failed";
