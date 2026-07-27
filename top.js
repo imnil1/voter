@@ -210,6 +210,18 @@ async function isTurnstilePresent(page) {
   }
 }
 
+// Polls for a Turnstile challenge over several seconds instead of checking
+// once after a fixed delay — Cloudflare's injection timing varies, and a
+// single early check can miss a challenge that renders a bit slower.
+async function pollForTurnstile(page, timeoutMs = 6000, intervalMs = 750) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (await isTurnstilePresent(page)) return true;
+    await delay(intervalMs);
+  }
+  return false;
+}
+
 // Extracts the Turnstile sitekey from the page. Checks the common places it
 // appears: a [data-sitekey] element, or embedded in the challenge iframe's src.
 async function getTurnstileSitekey(page) {
@@ -397,9 +409,9 @@ async function voteForBot(page, label, botId) {
     await voteBtn.click();
     log(`[vote:${shortT}] Vote button clicked for bot ${botId}, checking for Turnstile...`);
 
-    // Give Cloudflare a moment to inject the challenge iframe if it's going to.
-    await delay(1500);
-    if (await isTurnstilePresent(page)) {
+    // Cloudflare can take a few seconds to inject the challenge iframe —
+    // poll instead of a single fixed-delay check, so slower renders aren't missed.
+    if (await pollForTurnstile(page)) {
       log(`[vote:${shortT}] Turnstile challenge appeared for bot ${botId} — attempting to solve...`);
       const solved = await trySolveTurnstileOnPage(page, shortT);
       if (!solved) {
