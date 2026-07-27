@@ -468,11 +468,15 @@ async function voteAllBotsForToken(token, botIds, label) {
     if (!res.ok) {
       log(`[token:${shortT}] Invalid token, skipping`);
       clearCookies(token);
-      return;
+      const failResults = {};
+      for (const botId of botIds) failResults[botId] = "failed";
+      return failResults;
     }
   } catch (err) {
     log(`[token:${shortT}] Validation error: ${err.message}`);
-    return;
+    const failResults = {};
+    for (const botId of botIds) failResults[botId] = "failed";
+    return failResults;
   }
   log(`[token:${shortT}] Valid`);
 

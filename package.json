@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "top.gg auto voter with remote browser and per-token scheduling",
   "main": "index.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
     "start": "node index.js"
   },
