@@ -70,7 +70,18 @@ function formatMs(ms) {
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
 
-function nowISO() { return new Date().toISOString(); }
+function nowISO() {
+  try {
+    return new Date().toLocaleString("en-US", {
+      timeZone: timezone,
+      year: "numeric", month: "short", day: "numeric",
+      hour: "numeric", minute: "2-digit", second: "2-digit",
+      hour12: true,
+    });
+  } catch (_) {
+    return new Date().toISOString();
+  }
+}
 
 const TURNSTILE_RETRY_MS = 10 * 60 * 1000; // retry Turnstile-blocked bots after 10 min
 const TURNSTILE_MAX_RETRIES = 3; // give up after this many retries until the next scheduled slot

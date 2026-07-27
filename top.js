@@ -35,8 +35,22 @@ function clearCookies(token) {
   } catch (_) {}
 }
 
-function nowISO() { return new Date().toISOString(); }
-function log(msg) { console.log(`[${nowISO()}] ${msg}`); }
+// Human-readable timestamp in the configured TIMEZONE (falls back to UTC if
+// unset/invalid), e.g. "Jul 27, 2026, 9:39:01 AM" instead of raw ISO 8601 UTC.
+const LOG_TIMEZONE = process.env.TIMEZONE || "UTC";
+function nowFormatted() {
+  try {
+    return new Date().toLocaleString("en-US", {
+      timeZone: LOG_TIMEZONE,
+      year: "numeric", month: "short", day: "numeric",
+      hour: "numeric", minute: "2-digit", second: "2-digit",
+      hour12: true,
+    });
+  } catch (_) {
+    return new Date().toISOString();
+  }
+}
+function log(msg) { console.log(`[${nowFormatted()}] ${msg}`); }
 
 // Saves a full-page screenshot for debugging unconfirmed/failed votes.
 // Filename includes label, botId, and a timestamp so repeated failures
@@ -45,11 +59,16 @@ function log(msg) { console.log(`[${nowISO()}] ${msg}`); }
 async function saveDebugScreenshot(page, label, botId, reason) {
   try {
     if (!fs.existsSync(SCREENSHOT_DIR)) fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
+    // Give any in-flight rendering (images, lazy content) a moment to settle
+    // before capturing — otherwise fullPage screenshots can come out
+    // truncated if taken the instant a text condition becomes true.
+    await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
+    await delay(500);
     const safeLabel = String(label).replace(/[^a-zA-Z0-9_-]/g, "_");
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const filename = `${safeLabel}_${botId}_${reason}_${timestamp}.png`;
     const filepath = path.join(SCREENSHOT_DIR, filename);
-    await page.screenshot({ path: filepath, fullPage: true });
+    await page.screenshot({ path: filepath, fullPage: false });
     log(`[screenshot:${label}] Saved debug screenshot for bot ${botId}: ${filename}`);
   } catch (err) {
     log(`[screenshot:${label}] Failed to save screenshot: ${err.message}`);
@@ -409,8 +428,26 @@ async function voteForBot(page, label, botId) {
     }
 
     log(`[vote:${shortT}] Vote click did not confirm for bot ${botId}, retrying once...`);
+    await saveDebugScreenshot(page, shortT, botId, "before-reload");
     await page.reload({ waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
     await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+
+    // A reload can restart the ~10s ad countdown, so re-run the same status
+    // wait used on first load instead of assuming the button is immediately
+    // clickable — otherwise a fresh ad-wait screen is misread as "no button".
+    const retryStatus = await waitForVoteStatus(page, 30_000);
+
+    if (retryStatus === "already") {
+      log(`[vote:${shortT}] Already voted for bot ${botId} (discovered on retry)`);
+      return "already";
+    }
+
+    if (retryStatus !== "vote") {
+      log(`[vote:${shortT}] Retry did not reach a votable state for bot ${botId} (status: ${retryStatus})`);
+      await saveDebugScreenshot(page, shortT, botId, "retry-status-" + retryStatus);
+      return "failed";
+    }
+
     const retryBtn = page.locator("button.button-primary:not([disabled])", { hasText: "Vote" }).first();
     const retryVisible = await retryBtn.isVisible().catch(() => false);
     if (retryVisible) {

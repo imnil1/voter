@@ -1,3 +1,5 @@
+# top-gg-voter-railway
+
 Automates voting for Discord bots on top.gg using multiple Discord tokens,
 via a remote browser (Playwright connected to a `browserless-v2` instance),
 with per-token scheduling, Cloudflare Turnstile solving, and debug
