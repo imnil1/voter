@@ -190,12 +190,22 @@ async function connectBrowser() {
   return { browser, context, page };
 }
 
+// Checks for the actual "Login" *button* in the top nav, not just the
+// substring "Login" anywhere in body text — top.gg's page can contain the
+// word "Login" in other contexts (banners, ads, etc.) independent of
+// session state, so text-matching alone is not a reliable signal. A logged
+// out session shows a clickable "Login" button in the top-right nav; a
+// logged-in session replaces it with the user's avatar and no such button.
+async function hasLoginButton(page) {
+  const loginBtn = page.locator("button", { hasText: "Login" }).first();
+  return loginBtn.isVisible().catch(() => false);
+}
+
 async function isLoggedInToTopgg(page) {
   try {
     await page.goto("https://top.gg", { waitUntil: "domcontentloaded", timeout: 30000 });
     await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
-    const bodyText = await page.locator("body").innerText();
-    return !bodyText.includes("Login");
+    return !(await hasLoginButton(page));
   } catch (_) {
     return false;
   }
@@ -211,18 +221,14 @@ async function doOAuth(page, token, label) {
   await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
 
   log(`[auth:${label}] Clicking login button...`);
-  const loginBtn = page.locator("button", { hasText: "Login" }).first();
-  const loginVisible = await loginBtn.isVisible().catch(() => false);
+  const loginVisible = await hasLoginButton(page);
 
   if (!loginVisible) {
-    const bodyText = await page.locator("body").innerText();
-    if (!bodyText.includes("Login")) {
-      log(`[auth:${label}] Already logged in`);
-      return;
-    }
-    throw new Error("Login button not found and not logged in");
+    log(`[auth:${label}] Already logged in`);
+    return;
   }
 
+  const loginBtn = page.locator("button", { hasText: "Login" }).first();
   await loginBtn.click();
   try {
     await page.waitForLoadState("domcontentloaded", { timeout: 15000 });
@@ -297,8 +303,10 @@ async function doOAuth(page, token, label) {
   await page.waitForLoadState("domcontentloaded", { timeout: 15000 });
   await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
 
-  const bodyText = await page.locator("body").innerText();
-  if (bodyText.includes("Login")) throw new Error("Authorization failed - Discord OAuth did not complete");
+  if (await hasLoginButton(page)) {
+    await saveDebugScreenshot(page, label, "oauth", "still-logged-out-after-authorize", true);
+    throw new Error("Authorization failed - Discord OAuth did not complete");
+  }
   log(`[auth:${label}] Authorization successful`);
 }
 
