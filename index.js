@@ -175,3 +175,12 @@ for (const entry of tokens) {
 
 console.log(`[${nowISO()}] [main] Using timezone: ${timezone}`);
 console.log(`[${nowISO()}] [main] Scheduler started — ${tokens.length} token(s), ${botIds.length} bot(s)`);
+
+// Keeps the process alive indefinitely, even if every configured token is
+// immediate-run-only (no voteAt) and has nothing left to schedule — without
+// this, Node's event loop can empty out and the process exits naturally
+// once all one-shot runs finish, which looks like a crash but isn't one.
+const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+setInterval(() => {
+  console.log(`[${nowISO()}] [main] Heartbeat — still running`);
+}, HEARTBEAT_INTERVAL_MS);
