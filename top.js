@@ -64,6 +64,10 @@ async function saveDebugScreenshot(page, label, botId, reason, fullPage = false)
     // truncated if taken the instant a text condition becomes true.
     await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => {});
     await delay(500);
+    // Re-assert viewport in case a navigation/redirect reset it — CDP-connected
+    // sessions can be less reliable about retaining viewport size than a
+    // locally-launched browser.
+    await page.setViewportSize({ width: 1920, height: 1080 }).catch(() => {});
     const safeLabel = String(label).replace(/[^a-zA-Z0-9_-]/g, "_");
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const filename = `${safeLabel}_${botId}_${reason}_${timestamp}.png`;
@@ -76,13 +80,28 @@ async function saveDebugScreenshot(page, label, botId, reason, fullPage = false)
 }
 
 async function connectBrowser() {
-  const wsEndpoint = process.env.BROWSER_WS_URL;
-  if (!wsEndpoint) throw new Error("BROWSER_WS_URL is not set");
+  const baseWsEndpoint = process.env.BROWSER_WS_URL;
+  if (!baseWsEndpoint) throw new Error("BROWSER_WS_URL is not set");
+
+  // browserless v2 can render in an undersized frame regardless of any
+  // post-connect page.setViewportSize() call. Browserless staff recommend
+  // combining both defaultViewport (page-level) and --window-size (actual
+  // Chrome window) in the same launch param for reliability.
+  // See: https://github.com/browserless/browserless/discussions/3910
+  const launchParams = JSON.stringify({
+    defaultViewport: { width: 1920, height: 1080 },
+    args: ["--window-size=1920,1080"],
+  });
+  const separator = baseWsEndpoint.includes("?") ? "&" : "?";
+  const wsEndpoint = `${baseWsEndpoint}${separator}launch=${encodeURIComponent(launchParams)}`;
+
   log(`[browser] Connecting via Playwright (CDP)...`);
   const browser = await chromium.connectOverCDP(wsEndpoint, { timeout: 30000 });
   const context = browser.contexts()[0] || (await browser.newContext());
   const page = await context.newPage();
   await page.setViewportSize({ width: 1920, height: 1080 });
+  const actualViewport = page.viewportSize();
+  log(`[browser] Viewport set to ${actualViewport?.width}x${actualViewport?.height}`);
   await page.setExtraHTTPHeaders({
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
   });
