@@ -301,9 +301,28 @@ async function doOAuth(page, token, label) {
   await page.evaluate(() => { document.body.style.zoom = "1"; }).catch(() => {});
 
   await page.waitForLoadState("domcontentloaded", { timeout: 15000 });
-  await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
 
-  if (await hasLoginButton(page)) {
+  // `networkidle` is unreliable here (see saveDebugScreenshot's comments —
+  // continuous background activity from analytics/Turnstile-adjacent
+  // scripts can make it silently time out every time), so rather than
+  // trusting a fixed settle delay before checking login state, poll for
+  // the state to actually resolve one way or the other. This closes a race
+  // where hasLoginButton() could run on a page still mid-redirect from
+  // Discord back to top.gg, before either the Login button or the logged-in
+  // UI has actually rendered — which would make a real login look like a
+  // false failure (or vice versa).
+  const OAUTH_SETTLE_TIMEOUT_MS = 15000;
+  const settleStart = Date.now();
+  let stillLoggedOut = true;
+  while (Date.now() - settleStart < OAUTH_SETTLE_TIMEOUT_MS) {
+    stillLoggedOut = await hasLoginButton(page);
+    if (!stillLoggedOut) break;
+    await delay(500);
+  }
+
+  if (stillLoggedOut) {
+    const currentUrl = page.url();
+    log(`[auth:${label}] Still shows logged out after authorize (waited ${OAUTH_SETTLE_TIMEOUT_MS / 1000}s) — current URL: ${currentUrl}`);
     await saveDebugScreenshot(page, label, "oauth", "still-logged-out-after-authorize", true);
     throw new Error("Authorization failed - Discord OAuth did not complete");
   }
