@@ -326,7 +326,13 @@ async function doOAuth(page, token, label) {
     await saveDebugScreenshot(page, label, "oauth", "still-logged-out-after-authorize", true);
     throw new Error("Authorization failed - Discord OAuth did not complete");
   }
-  log(`[auth:${label}] Authorization successful`);
+  log(`[auth:${label}] Authorization successful (on ${page.url()})`);
+  // Confirm this success is real, not a transient false-positive from the
+  // login-button poll — capture the actual post-auth page state so a
+  // regression (session reported successful here but logged-out on the
+  // next navigation) is visible in the screenshot, not just inferred from
+  // a later timeout several bots downstream.
+  await saveDebugScreenshot(page, label, "oauth", "post-authorize-confirmed", true);
 }
 
 // DOM-structure-based state check (not text matching) — more robust to copy changes.
@@ -775,7 +781,7 @@ async function voteAllBotsForToken(token, botIds, label) {
       await doOAuth(page, token, shortT);
       const cookies = await context.cookies();
       saveCookies(token, cookies);
-      log(`[token:${shortT}] Cookies saved`);
+      log(`[token:${shortT}] Cookies saved (${cookies.length} total): ${cookies.map(c => `${c.name}[domain=${c.domain},path=${c.path},secure=${c.secure},sameSite=${c.sameSite}]`).join(", ")}`);
     }
 
     // Sequential processing, one bot/page at a time. Pre-opening tabs for
