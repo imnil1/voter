@@ -180,7 +180,7 @@ console.log(`[${nowISO()}] [main] Scheduler started — ${tokens.length} token(s
 // immediate-run-only (no voteAt) and has nothing left to schedule — without
 // this, Node's event loop can empty out and the process exits naturally
 // once all one-shot runs finish, which looks like a crash but isn't one.
+// No log line needed here — the interval itself is what matters, not
+// printing anything on each tick (was cluttering logs every 5 min).
 const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
-setInterval(() => {
-  console.log(`[${nowISO()}] [main] Heartbeat — still running`);
-}, HEARTBEAT_INTERVAL_MS);
+setInterval(() => {}, HEARTBEAT_INTERVAL_MS);
