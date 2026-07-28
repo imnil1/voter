@@ -1,4 +1,4 @@
-const { log } = require("./lib/logging");
+const { log, logVerbose } = require("./lib/logging");
 const { delay } = require("./lib/util");
 const { loadCookies, saveCookies, clearCookies } = require("./lib/cookies");
 const { connectBrowser } = require("./lib/browser");
@@ -57,7 +57,8 @@ async function voteAllBotsForToken(token, botIds, label) {
       await doOAuth(page, token, shortT);
       const cookies = await context.cookies();
       saveCookies(token, cookies);
-      log(`[token:${shortT}] Cookies saved (${cookies.length} total): ${cookies.map(c => `${c.name}[domain=${c.domain},path=${c.path},secure=${c.secure},sameSite=${c.sameSite}]`).join(", ")}`);
+      log(`[token:${shortT}] Cookies saved (${cookies.length} total)`);
+      logVerbose(`[token:${shortT}] Cookie detail: ${cookies.map(c => `${c.name}[domain=${c.domain},path=${c.path},secure=${c.secure},sameSite=${c.sameSite}]`).join(", ")}`);
     }
 
     // Sequential processing, one bot/page at a time, reusing the single
