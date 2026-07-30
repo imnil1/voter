@@ -9,6 +9,12 @@ persists per-token cookies/sessions across runs, so a stable browser
 identity is arguably more consistent with that than rotating fingerprints
 would be.
 
+humanize=True is set per playwright-captcha's own recommended Camoufox
+stealth setup — it makes cursor movement and click timing look human
+(curved paths, realistic delays) rather than instantaneous/robotic, which
+both helps against Cloudflare's own risk scoring and may be relevant to
+click-based Turnstile solving actually registering as a real interaction.
+
 Requires: pip install camoufox[geoip]
 First run also needs: camoufox fetch (downloads the browser binary)
 """
@@ -21,22 +27,13 @@ WS_PATH = os.environ.get("CAMOUFOX_WS_PATH", "voter")
 
 if __name__ == "__main__":
     print(f"[camoufox-server] Starting on port {PORT}, path /{WS_PATH}...")
-    server = launch_server(
+    # launch_server() blocks forever on its own (it communicates with a
+    # subprocess and only returns/raises on that process exiting) — no
+    # extra sleep loop needed after this call.
+    launch_server(
         headless=True,
         geoip=True,
+        humanize=True,
         port=PORT,
         ws_path=WS_PATH,
     )
-    print(f"[camoufox-server] Ready. WS endpoint: {server.ws_endpoint()}")
-    print("[camoufox-server] Set this as CAMOUFOX_WS_URL in the voter's environment.")
-
-    # Keep the process alive — launch_server runs the server in the
-    # background; without blocking here, the script would exit immediately
-    # and tear the server down with it.
-    try:
-        import time
-        while True:
-            time.sleep(3600)
-    except KeyboardInterrupt:
-        print("[camoufox-server] Shutting down...")
-        server.close()
