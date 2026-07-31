@@ -138,25 +138,49 @@ async def try_solve_turnstile_on_page(page, short_t="?", bot_id="?") -> bool:
     """Solves an in-page Turnstile challenge using playwright_captcha's
     ClickSolver against the voter's own live page/context — clicks the real
     checkbox element (found via shadow-root/light-DOM traversal), rather
-    than the old sitekey-extraction + external-API + token-injection flow."""
+    than the old sitekey-extraction + external-API + token-injection flow.
+
+    Cloudflare can inject the actual interactive checkbox into the iframe
+    some time after the outer widget container first appears in the DOM —
+    the container existing (what is_turnstile_present checks) doesn't
+    guarantee the checkbox inside is ready yet. ClickSolver's own internal
+    attempt budget can run out during that gap. Rather than trust a single
+    ClickSolver call, this re-attempts it in an outer loop as long as our
+    own reliable detection still shows the widget present, so a
+    late-appearing checkbox gets caught on a subsequent pass instead of
+    the whole solve being abandoned after one internal timeout."""
     try:
         from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
     except ImportError as e:
         log(f"[turnstile-solver:{short_t}] playwright_captcha not available: {e}")
         return False
 
-    try:
-        async with ClickSolver(framework=FrameworkType.CAMOUFOX, page=page) as solver:
-            await solver.solve_captcha(
-                captcha_container=page,
-                captcha_type=CaptchaType.CLOUDFLARE_TURNSTILE,
-            )
-        log(f"[turnstile-solver:{short_t}] ClickSolver solved Turnstile for bot {bot_id}")
-        return True
-    except Exception as e:
-        log(f"[turnstile-solver:{short_t}] ClickSolver could not solve Turnstile for bot {bot_id}: {e}")
-        await save_debug_html(page, short_t, bot_id, "turnstile-clicksolver-failed")
-        return False
+    OUTER_MAX_ATTEMPTS = 3
+    OUTER_RETRY_DELAY_S = 5
+
+    last_err = None
+    for outer_attempt in range(1, OUTER_MAX_ATTEMPTS + 1):
+        if not await is_turnstile_present(page, short_t):
+            log(f"[turnstile-solver:{short_t}] Turnstile no longer present for bot {bot_id} (resolved on its own or page moved on) — treating as solved")
+            return True
+
+        try:
+            async with ClickSolver(framework=FrameworkType.CAMOUFOX, page=page) as solver:
+                await solver.solve_captcha(
+                    captcha_container=page,
+                    captcha_type=CaptchaType.CLOUDFLARE_TURNSTILE,
+                )
+            log(f"[turnstile-solver:{short_t}] ClickSolver solved Turnstile for bot {bot_id} (outer attempt {outer_attempt})")
+            return True
+        except Exception as e:
+            last_err = e
+            if outer_attempt < OUTER_MAX_ATTEMPTS:
+                log(f"[turnstile-solver:{short_t}] ClickSolver attempt {outer_attempt}/{OUTER_MAX_ATTEMPTS} failed for bot {bot_id} ({e}) — checkbox may not have been ready yet, retrying in {OUTER_RETRY_DELAY_S}s...")
+                await delay(OUTER_RETRY_DELAY_S * 1000)
+
+    log(f"[turnstile-solver:{short_t}] ClickSolver could not solve Turnstile for bot {bot_id} after {OUTER_MAX_ATTEMPTS} outer attempts: {last_err}")
+    await save_debug_html(page, short_t, bot_id, "turnstile-clicksolver-failed")
+    return False
 
 
 async def try_solve_interstitial_on_page(page, short_t="?", bot_id="?") -> bool:
